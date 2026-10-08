@@ -29,6 +29,32 @@ three.
 
 ## Constraints and failure behavior
 
+### Linux GTK3 font DPI
+
+Before Wails creates the panel or main WebView, `Run` calls
+[`prepareNativeWebkit`](../../internal/gui/webkit_dpi_linux.go) on the main
+thread locked by Wails' desktop initialization. It initializes GTK3 with
+`gtk_init_check` and returns an error if no display is usable. This happens
+before starting the backend or application startup tasks; backend-only
+development returns earlier. An `ApplicationStarted` callback is too late,
+since Wails has already scheduled its pending windows by then.
+
+The [native helper](../../internal/gui/webkit_dpi_gtk3.h) keeps a finite,
+positive GDK screen resolution. Otherwise it uses a positive `gtk-xft-dpi`
+setting (in 1024ths of a DPI), or 96 DPI when no valid setting exists, and
+applies a finite, positive `GDK_DPI_SCALE` when the result is valid. It does
+not change `GDK_SCALE`, compositor scaling, or the application's text zoom.
+This is process-local and covers both initial windows and panels recreated
+later. GTK4, macOS, Windows, `nogui`, CLI and browser mode do not run it.
+
+[GDK permits an unset resolution of -1](https://docs.gtk.org/gdk3/method.Screen.get_resolution.html).
+[WebKitGTK 2.54.1's GTK3 settings reader](https://github.com/WebKit/WebKit/blob/webkitgtk-2.54.1/Source/WebKit/UIProcess/gtk/SystemSettingsManagerProxyGtk.cpp)
+multiplies that sentinel by 1024, producing invalid font scaling and
+negative viewport dimensions. A positive startup `gtk-xft-dpi` property
+alone can still leave GDK unset, and setting the resolution after WebView
+creation does not repair the captured initial settings. The workaround
+supplies the missing resolution before any WebView captures it.
+
 ### Routing purpose filter
 
 The request heading's purpose menu in [`routing.js`](../../internal/gui/assets/routing.js)
@@ -126,12 +152,65 @@ waits for `show` to accept navigation before creating its draft.
 
 ```sh
 go test -tags nogui ./internal/gui
+go test -v -count=1 -timeout=5m -tags gtk3 ./internal/gui -run '^TestGTK3WebkitDPI$'
 go test -v ./internal/fonts         # native discovery on each desktop OS
 make test-ui                      # every internal/gui/tests/*.test.cjs, Chromium and WebKit
 BROWSER=webkit node --test internal/gui/tests/click-scroll.test.cjs
 ```
 
+`TestGTK3WebkitDPI` needs a usable Linux display, `cc`, `pkg-config`, and
+GTK3/WebKitGTK 4.1 development libraries. It runs the same native helper in
+isolated child processes and measures actual WebKit viewport, content width,
+font size and device scale in main-sized and panel-sized WebViews. Cases cover
+unset DPI, configured and existing DPI, font/device scaling, text zoom,
+invalid scale values and initialization without a display. With no display
+the native test is skipped; that is not runtime verification. It does not
+start a gateway or contact an existing Magpie instance. Checking the full
+desktop startup and tray integration separately still requires an isolated
+HOME/XDG state and gateway address.
+
 `make test-ui` needs Node.js and Playwright (`playwright install chromium
 webkit`). Set `NODE_PATH` when Playwright is installed outside the repo. The
 Test workflow in CI does not run this suite, so a GUI change must run it
 locally and report the result. See [`tests/README.md`](../../internal/gui/tests/README.md).
+
+The [standalone C probe](../../internal/gui/testdata/gtk3_dpi_probe.c)
+can reproduce the GTK3/WebKitGTK failure without Go, Wails, a running
+magpie, or magpie's assets. By default it does not apply
+the compatibility helper. It explicitly sets GDK's font resolution to the
+first argument before creating a WebView; `-1` reproduces GTK's lawful
+unset value even on desktops that normally supply a positive DPI. The
+second argument is WebKit's zoom level.
+
+From the repository root, with GTK3/WebKitGTK 4.1 development libraries and
+a usable display:
+
+```sh
+probe_dir=$(mktemp -d)
+cc internal/gui/testdata/gtk3_dpi_probe.c -o "$probe_dir/probe" \
+  $(pkg-config --cflags --libs gtk+-3.0 webkit2gtk-4.1)
+mkdir -p "$probe_dir/home"
+for dpi in -1 96; do
+  env HOME="$probe_dir/home" XDG_CONFIG_HOME="$probe_dir/home/.config" \
+    XDG_CACHE_HOME="$probe_dir/home/.cache" XDG_DATA_HOME="$probe_dir/home/.local/share" \
+    XDG_STATE_HOME="$probe_dir/home/.local/state" GSETTINGS_BACKEND=memory \
+    GDK_DPI_SCALE=1 WEBKIT_DISABLE_COMPOSITING_MODE=1 "$probe_dir/probe" "$dpi" 1
+done
+rm -rf "$probe_dir"
+```
+
+Each invocation prints the GTK and WebKitGTK versions, the initial and
+requested font DPI, and two `layout` rows (main window and tray-sized
+panel). A row contains: window ID, font DPI, JavaScript viewport width and
+height, content width, CSS font size, native allocated width, current
+device scale, and initial device scale. On affected WebKitGTK 2.54.1,
+`-1` yields negative viewport dimensions and a huge font; `96` yields
+positive dimensions and the declared 16px font. A successful measurement
+exits zero even when the measured layout is broken. Missing display exits
+3; failed measurement or the 15-second timeout exits 1.
+
+To exercise magpie's actual compatibility helper with the same probe,
+add `-DMAGPIE_DPI_GUARD -Iinternal/gui` to the compile command and rerun
+`-1 1`. The viewport should be positive, font DPI 96, CSS font size 16px,
+and device scale unchanged. `TestGTK3WebkitDPI` uses this guarded build and
+asserts the native layout; removing the guard makes the unset case fail.

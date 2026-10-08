@@ -292,6 +292,9 @@ func Run(version string, showMain bool, link string) error {
 	if runningAlready(showMain || OpenPanel, link) {
 		return nil
 	}
+	if err := prepareNativeWebkit(); err != nil {
+		return err
+	}
 	go func() {
 		if err := registerScheme(); err != nil {
 			log.Println("magpie:// links:", err)
